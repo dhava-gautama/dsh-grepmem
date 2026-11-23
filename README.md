@@ -75,7 +75,18 @@ Long lines are clipped around the match for display; the stored history is uncha
 
 The plugin keeps a small LRU of folded session entries (default: 6 sessions, 16 MB). Repeated calls reuse the fold; when new events arrive, only the appended suffix is processed. A live session's next sequence number skips the read entirely when nothing changed. A persisted session is reused for `persistedCacheTtlMs` (default 15 s) before it is read again, so a burst of cross-session searches does not rescan every log. A cold read of a very large session still costs proportional time and memory, but it happens once per cache lifetime, not once per call. Entries larger than `cacheChars` are not cached.
 
-Normal searches run in-process inside a `vm` context with a short watchdog (`fastTimeoutMs`, default 200 ms). That avoids worker startup and a structured clone of the whole history, which dominate warm-call latency. On a synthetic 32 MiB log, a warm scan dropped from ~230 ms to ~45 ms; at 4 MiB it is ~3 ms. If the fast path hits its deadline — a pathological pattern or a very large log — the worker fallback runs with the full `timeoutMs` and cannot block the Host. The fast path may block the Host for up to `fastTimeoutMs` before that fallback starts.
+Normal searches run in-process inside a `vm` context with a short watchdog (`fastTimeoutMs`, default 200 ms). That avoids worker startup and a structured clone of the whole history, which dominate warm-call latency.
+
+Synthetic warm scans, excluding the cold session read/replay:
+
+| Log | Worker path | Fast path |
+|---:|---:|---:|
+| 1 MiB | 58 ms | 2 ms |
+| 4 MiB | 63 ms | 3 ms |
+| 16 MiB | 144 ms | 25 ms |
+| 32 MiB | 233 ms | 50 ms |
+
+If the fast path hits its deadline — a pathological pattern or a very large log — the worker fallback runs with the full `timeoutMs` and cannot block the Host. The fast path may block the Host for up to `fastTimeoutMs` before that fallback starts.
 
 Reading logs and folding entries happen on the Host thread and are not interruptible by either deadline.
 
