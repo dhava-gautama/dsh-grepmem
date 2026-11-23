@@ -70,7 +70,7 @@ function harness({ events = {}, records = [], titles = {}, config = {}, liveSeqs
       get(sessionId) {
         return {
           session: { seq: liveSeqs[sessionId] },
-          inbox: { inject(message) { injected.push(message) } },
+          inject(message) { injected.push(message) },
         }
       },
     },

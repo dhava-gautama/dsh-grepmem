@@ -735,7 +735,7 @@ function installCompactionNudge(ctx) {
     const agent = ctx.agents.get(session.id)
     if (agent === undefined) return
     try {
-      agent.inbox.inject({
+      agent.inject({
         id: `grepmem-${randomUUID()}`,
         role: 'user',
         content: [{ type: 'text', text: NUDGE_TEXT }],
