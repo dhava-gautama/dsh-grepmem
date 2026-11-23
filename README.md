@@ -73,7 +73,7 @@ Long lines are clipped around the match for display; the stored history is uncha
 
 ## Performance and caching
 
-The plugin keeps a small LRU of folded session entries (default: 6 sessions, 16 MB). Repeated calls reuse the fold; when new events arrive, only the appended suffix is processed. A cold read of a very large session still costs proportional time and memory, but it happens once per cache lifetime, not once per call. Entries larger than `cacheChars` are not cached.
+The plugin keeps a small LRU of folded session entries (default: 6 sessions, 16 MB). Repeated calls reuse the fold; when new events arrive, only the appended suffix is processed. A live session's next sequence number skips the read entirely when nothing changed. A persisted session is reused for `persistedCacheTtlMs` (default 15 s) before it is read again, so a burst of cross-session searches does not rescan every log. A cold read of a very large session still costs proportional time and memory, but it happens once per cache lifetime, not once per call. Entries larger than `cacheChars` are not cached.
 
 Regex matching runs in a worker thread with a hard deadline (`timeoutMs`), so catastrophic backtracking cannot block the Host. Reading logs and folding entries happen on the Host thread and are not interruptible by that deadline.
 
@@ -100,6 +100,8 @@ Set these in the profile's `cordis.patch.yml` under the `grepmem` row:
 | `maxSessions` | `6` | Default and maximum sessions per `grep_sessions` call (1–25). |
 | `cacheSessions` | `6` | Folded session logs kept in the LRU (1–24). |
 | `cacheChars` | `16000000` | Approximate character budget of the LRU (1 MB–128 MB). |
+| `persistedCacheTtlMs` | `15000` | Reuse a persisted session's fold for this long before re-reading (0–300000; 0 disables). |
+| `compactionNudge` | `true` | Queue a short "history is still greppable" notice after compaction. Never wakes an idle agent. |
 | `includeReasoning` | `false` | Also search assistant reasoning blocks, when present. |
 
 ## How it works
@@ -108,12 +110,13 @@ Set these in the profile's `cordis.patch.yml` under the `grepmem` row:
 2. Raw events are folded into entries: user messages, assistant replies, compaction summaries, and one entry per tool result paired with its call. Content compaction shadowed stays available because the raw log is read, not the model surface.
 3. The fold is cached per session and extended by suffix on later calls. A live session's next sequence number skips the read entirely when nothing changed; a persisted session is read again, but its fold is reused when the log length is unchanged.
 4. A worker thread runs the regex (line mode or multiline) with a watchdog. The page renderer labels sessions and turns, clips long lines, and stops at `resultChars`.
+5. After a compaction, the plugin best-effort queues one short user-role notice saying the removed history is still greppable. It is queued for the next pre-step and never wakes an idle agent; disable it with `compactionNudge: false`.
 
 ## Limits
 
 - **Same workspace only.** `grep_sessions` requires an exact `cwd` match and searches at most `maxSessions` sessions, newest first. It is not a global or cross-workspace index; use `dsh-experimental-session-search` for indexed full-text search across a workspace.
-- **No trained recall policy.** The paper trains a model with RL to decide when to summarize and when to grep. That requires the GrepMem training stack and weights; this plugin supplies the inference-time capability and prompt guidance, not the learned policy. A custom compaction backend or a trained checkpoint would be the next step.
-- **Cold reads are bounded only by the process.** The worker deadline covers matching, not loading and folding a very large log. The LRU bounds how much stays in memory, not how long the first read takes.
+- **No trained recall policy.** The paper trains a model with RL to decide when to summarize and when to grep. That requires the GrepMem training stack and weights. This plugin supplies the inference-time capability, prompt triggers, and a post-compaction nudge, not the learned policy. A custom compaction backend or a trained checkpoint would be the next step.
+- **Cold reads are bounded only by the process.** The worker deadline covers matching, not loading and folding a very large log. The LRU and `persistedCacheTtlMs` bound repeated work, not how long the first read takes.
 - **Compaction is optional.** Recall works without it, but there is less discarded context to recover.
 - **Regex is not RE2.** Patterns run in JavaScript; the worker deadline is the safety net. Extremely large logs can still make a single search slow before the deadline fires.
 - **Recall can echo prior answers.** Only grep tool results are skipped. If a previous answer, subagent report, or summary quoted a match, that text remains in the log and can match again. Use more specific patterns or a session scope when that noise matters.

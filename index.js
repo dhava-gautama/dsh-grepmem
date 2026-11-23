@@ -18,6 +18,7 @@
  * @module @local/dsh-grepmem
  */
 
+import { randomUUID } from 'node:crypto'
 import { Worker } from 'node:worker_threads'
 
 /** Cordis plugin name used by Loader diagnostics. */
@@ -36,6 +37,8 @@ const DEFAULTS = Object.freeze({
   maxSessions: 6,
   cacheSessions: 6,
   cacheChars: 16_000_000,
+  persistedCacheTtlMs: 15_000,
+  compactionNudge: true,
   includeReasoning: false,
 })
 
@@ -48,6 +51,7 @@ const LIMITS = Object.freeze({
   maxSessions: 25,
   cacheSessions: 24,
   cacheChars: 128_000_000,
+  persistedCacheTtlMs: 300_000,
 })
 
 const HISTORY_TOOL = 'grep_history'
@@ -66,6 +70,12 @@ const PROMPT_TEXT = [
   'errors, or earlier tool output - before saying a detail is unavailable or redoing work.',
   'Use grep_sessions to search earlier sessions in the same workspace when the detail may predate this one.',
 ].join('\n')
+
+const NUDGE_TEXT = [
+  '[GrepMem] Older context was just compacted. Your full history, including the removed messages and',
+  'tool output, is still searchable with grep_history. Grep for exact details before redoing work or',
+  'reporting them unavailable.',
+].join(' ')
 
 const HISTORY_DESCRIPTION = [
   'Search the complete, uncompressed log of this session with a case-insensitive regular expression.',
@@ -150,6 +160,8 @@ function resolveConfig(raw) {
     maxSessions: clampInteger(config.maxSessions, DEFAULTS.maxSessions, 1, LIMITS.maxSessions),
     cacheSessions: clampInteger(config.cacheSessions, DEFAULTS.cacheSessions, 1, LIMITS.cacheSessions),
     cacheChars: clampInteger(config.cacheChars, DEFAULTS.cacheChars, 1_000_000, LIMITS.cacheChars),
+    persistedCacheTtlMs: clampInteger(config.persistedCacheTtlMs, DEFAULTS.persistedCacheTtlMs, 0, LIMITS.persistedCacheTtlMs),
+    compactionNudge: config.compactionNudge !== false,
     includeReasoning: config.includeReasoning === true,
   }
 }
@@ -328,7 +340,7 @@ function createEntryCache(config) {
         sessions.delete(sessionId)
       }
       if (state.chars > config.cacheChars) return
-      sessions.set(sessionId, { state, nextSeq, chars: state.chars })
+      sessions.set(sessionId, { state, nextSeq, chars: state.chars, readAt: Date.now() })
       chars += state.chars
       evict()
     },
@@ -340,9 +352,14 @@ function createEntryCache(config) {
  * appending only the suffix when events were added. Falls back to a full fold
  * when the cached log is no longer a prefix of the observed log.
  */
-async function loadEntries(ctx, cache, sessionId, options, liveSeq) {
+async function loadEntries(ctx, cache, sessionId, options, liveSeq, persistedTtlMs) {
   const cached = cache.get(sessionId)
   if (cached !== undefined && liveSeq !== undefined && cached.nextSeq === liveSeq) {
+    cache.touch(sessionId)
+    return { state: cached.state }
+  }
+  if (cached !== undefined && liveSeq === undefined && persistedTtlMs > 0
+    && Date.now() - cached.readAt < persistedTtlMs) {
     cache.touch(sessionId)
     return { state: cached.state }
   }
@@ -574,6 +591,7 @@ async function executeHistory(ctx, args, exec, config, cache) {
     sessionId,
     { includeReasoning: config.includeReasoning, sessionId },
     agent.session.seq,
+    config.persistedCacheTtlMs,
   )
   if (loaded.error !== undefined) return `Error: could not read this session's history: ${loaded.error}`
 
@@ -626,6 +644,7 @@ async function executeSessions(ctx, args, exec, config, cache) {
       sessionId,
       { includeReasoning: config.includeReasoning, sessionId },
       liveAgent?.session?.seq,
+      config.persistedCacheTtlMs,
     )
     if (loaded.error !== undefined) {
       unreadable += 1
@@ -699,5 +718,31 @@ export function apply(ctx, config) {
     output: OUTPUT,
     timeoutMs: resolved.timeoutMs + 15_000,
     execute: (args, exec) => executeSessions(ctx, args, exec, resolved, cache),
+  })
+
+  if (resolved.compactionNudge) installCompactionNudge(ctx)
+}
+
+/**
+ * Best-effort policy substitute for the paper's trained recall policy: after a
+ * compaction, queue one short notice so the next step knows the removed
+ * history is still greppable. Injection never wakes an idle agent, and a
+ * disposed agent or rejected message is ignored.
+ */
+function installCompactionNudge(ctx) {
+  ctx.on('session/event', (session, event) => {
+    if (event?.type !== 'compaction/end' || session?.id === undefined) return
+    const agent = ctx.agents.get(session.id)
+    if (agent === undefined) return
+    try {
+      agent.inbox.inject({
+        id: `grepmem-${randomUUID()}`,
+        role: 'user',
+        content: [{ type: 'text', text: NUDGE_TEXT }],
+        source: { kind: 'grepmem', form: 'notice' },
+      })
+    } catch {
+      // A disposed agent or a rejected injection must not affect compaction.
+    }
   })
 }

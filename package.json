@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-grepmem",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
   "description": "GrepMem-style lossless history recall for DeepSeek Harness: regex-search the current session or earlier workspace sessions, including content removed by compaction.",
   "type": "module",

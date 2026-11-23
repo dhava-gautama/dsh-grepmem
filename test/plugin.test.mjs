@@ -35,9 +35,10 @@ function baseEvents() {
   ]
 }
 
-function harness({ events = {}, records = [], titles = {}, config = {}, liveSeqs = {} } = {}) {
+function harness({ events = {}, records = [], titles = {}, config = {}, liveSeqs = {}, injected = [] } = {}) {
   const tools = new Map()
   const reads = []
+  const handlers = new Map()
   const ctx = {
     systemPrompt: {
       section() {},
@@ -67,13 +68,18 @@ function harness({ events = {}, records = [], titles = {}, config = {}, liveSeqs
     },
     agents: {
       get(sessionId) {
-        const seq = liveSeqs[sessionId]
-        return seq === undefined ? undefined : { session: { seq } }
+        return {
+          session: { seq: liveSeqs[sessionId] },
+          inbox: { inject(message) { injected.push(message) } },
+        }
       },
+    },
+    on(event, handler) {
+      handlers.set(event, handler)
     },
   }
   apply(ctx, config)
-  return { tools, reads }
+  return { tools, reads, handlers, injected }
 }
 
 function execFor(sessionId = 'test-session', { cwd = '/work', seq } = {}) {
@@ -243,4 +249,61 @@ test('terminates a pathological pattern at the deadline', async () => {
   const text = await tools.get('grep_history').execute({ pattern: '(a+)+$' }, execFor('s1'))
   assert.match(text, /did not finish/)
   assert.ok(Date.now() - started < 5000)
+})
+
+test('reuses persisted session folds within the TTL', async () => {
+  const events = {
+    s2: [{
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'persisted echo zeta-3' }] },
+    }],
+  }
+  const records = [{ header: { id: 's2', cwd: '/work', createdAt: 2 } }]
+  const { tools, reads } = harness({
+    events,
+    records,
+    titles: { s2: 'Old work' },
+    config: { persistedCacheTtlMs: 60_000 },
+  })
+  const tool = tools.get('grep_sessions')
+  await tool.execute({ pattern: 'zeta-3' }, execFor('s1'))
+  await tool.execute({ pattern: 'zeta-3' }, execFor('s1'))
+  assert.equal(reads.filter(id => id === 's2').length, 1)
+})
+
+test('a zero TTL re-reads persisted sessions', async () => {
+  const events = {
+    s2: [{
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'persisted echo zeta-3' }] },
+    }],
+  }
+  const records = [{ header: { id: 's2', cwd: '/work', createdAt: 2 } }]
+  const { tools, reads } = harness({
+    events,
+    records,
+    titles: { s2: 'Old work' },
+    config: { persistedCacheTtlMs: 0 },
+  })
+  const tool = tools.get('grep_sessions')
+  await tool.execute({ pattern: 'zeta-3' }, execFor('s1'))
+  await tool.execute({ pattern: 'zeta-3' }, execFor('s1'))
+  assert.equal(reads.filter(id => id === 's2').length, 2)
+})
+
+test('injects a recall nudge after compaction', () => {
+  const { handlers, injected } = harness({ config: { compactionNudge: true } })
+  const handler = handlers.get('session/event')
+  assert.equal(typeof handler, 'function')
+  handler({ id: 's1' }, { type: 'compaction/start' })
+  assert.equal(injected.length, 0)
+  handler({ id: 's1' }, { type: 'compaction/end' })
+  assert.equal(injected.length, 1)
+  assert.equal(injected[0].role, 'user')
+  assert.match(injected[0].content[0].text, /grep_history/)
+})
+
+test('the nudge can be disabled', () => {
+  const { handlers } = harness({ config: { compactionNudge: false } })
+  assert.equal(handlers.get('session/event'), undefined)
 })
