@@ -307,3 +307,9 @@ test('the nudge can be disabled', () => {
   const { handlers } = harness({ config: { compactionNudge: false } })
   assert.equal(handlers.get('session/event'), undefined)
 })
+
+test('worker fallback matches the fast path result', async () => {
+  const { tools } = harness({ events: { s1: baseEvents() }, config: { fastPath: false } })
+  const text = await tools.get('grep_history').execute({ pattern: 'rotate-42' }, execFor('s1'))
+  assert.match(text, /^3 matching lines in 3 history entries/)
+})

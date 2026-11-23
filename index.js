@@ -19,7 +19,10 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import vm from 'node:vm'
 import { Worker } from 'node:worker_threads'
+
+import { scanCore } from './scan-core.js'
 
 /** Cordis plugin name used by Loader diagnostics. */
 export const name = 'grepmem'
@@ -39,6 +42,8 @@ const DEFAULTS = Object.freeze({
   cacheChars: 16_000_000,
   persistedCacheTtlMs: 15_000,
   compactionNudge: true,
+  fastPath: true,
+  fastTimeoutMs: 200,
   includeReasoning: false,
 })
 
@@ -52,6 +57,7 @@ const LIMITS = Object.freeze({
   cacheSessions: 24,
   cacheChars: 128_000_000,
   persistedCacheTtlMs: 300_000,
+  fastTimeoutMs: 5000,
 })
 
 const HISTORY_TOOL = 'grep_history'
@@ -162,6 +168,8 @@ function resolveConfig(raw) {
     cacheChars: clampInteger(config.cacheChars, DEFAULTS.cacheChars, 1_000_000, LIMITS.cacheChars),
     persistedCacheTtlMs: clampInteger(config.persistedCacheTtlMs, DEFAULTS.persistedCacheTtlMs, 0, LIMITS.persistedCacheTtlMs),
     compactionNudge: config.compactionNudge !== false,
+    fastPath: config.fastPath !== false,
+    fastTimeoutMs: clampInteger(config.fastTimeoutMs, DEFAULTS.fastTimeoutMs, 50, LIMITS.fastTimeoutMs),
     includeReasoning: config.includeReasoning === true,
   }
 }
@@ -390,11 +398,49 @@ async function loadEntries(ctx, cache, sessionId, options, liveSeq, persistedTtl
   return { state }
 }
 
+/** Precompiled fast-path scan. The function is embedded so it runs under a vm deadline. */
+const FAST_SCAN = (() => {
+  try {
+    return new vm.Script(`(${scanCore.toString()})(entries, pattern, offset, limit, countOnly, multiline)`)
+  } catch {
+    return undefined
+  }
+})()
+
+/**
+ * Try the in-process scan first. It avoids worker startup and a structured
+ * clone of the whole history, which dominate warm-call latency. A vm timeout
+ * bounds catastrophic backtracking; when it fires, the worker takes over so
+ * the Host is not left blocked for the full search deadline.
+ */
+function searchFast(entries, pattern, options) {
+  if (!options.fastPath || FAST_SCAN === undefined) return undefined
+  try {
+    return FAST_SCAN.runInNewContext({
+      entries,
+      pattern,
+      offset: options.offset,
+      limit: options.limit,
+      countOnly: options.countOnly,
+      multiline: options.multiline,
+    }, { timeout: options.fastTimeoutMs })
+  } catch (error) {
+    if (error?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') return undefined
+    if (error instanceof SyntaxError) return { error: `invalid regular expression: ${error.message}` }
+    return { error: String(error?.message ?? error) }
+  }
+}
+
 /**
  * Run the regex search in a worker so a pathological pattern or a very large
  * log can be terminated at the configured deadline instead of blocking the Host.
  */
 function searchEntries(entries, pattern, options) {
+  const fast = searchFast(entries, pattern, options)
+  if (fast !== undefined) {
+    return Promise.resolve(fast.error === undefined ? { kind: 'ok', ...fast } : { kind: 'error', message: fast.error })
+  }
+
   return new Promise(resolve => {
     let settled = false
     let worker
@@ -570,6 +616,8 @@ function searchOptions(parsed, config) {
     countOnly: parsed.countOnly,
     multiline: parsed.multiline,
     timeoutMs: config.timeoutMs,
+    fastPath: config.fastPath,
+    fastTimeoutMs: config.fastTimeoutMs,
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-grepmem",
-  "version": "1.1.3",
+  "version": "1.2.0",
   "private": true,
   "description": "GrepMem-style lossless history recall for DeepSeek Harness: regex-search the current session or earlier workspace sessions, including content removed by compaction.",
   "type": "module",
@@ -12,6 +12,7 @@
   },
   "files": [
     "index.js",
+    "scan-core.js",
     "grep-worker.mjs",
     "cordis.patch.yml",
     "locale/*.json",
