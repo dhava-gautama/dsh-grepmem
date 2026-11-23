@@ -382,6 +382,17 @@ function formatResult(entries, pattern, config, args, result) {
   return out.join('\n')
 }
 
+/** Place recall guidance next to the file-grep tool, falling back on older Harness versions. */
+function promptOrder(ctx) {
+  try {
+    const order = ctx.systemPrompt.getSectionOrder?.('TOOL_GREP')
+    if (Number.isFinite(order)) return order + 1
+  } catch {
+    // An older systemPrompt without the named placement still gets a stable slot.
+  }
+  return 1510
+}
+
 /** Register the recall tool and its short system-prompt guidance. */
 export function apply(ctx, config) {
   const resolved = resolveConfig(config)
@@ -389,7 +400,7 @@ export function apply(ctx, config) {
 
   ctx.systemPrompt.section({
     name: 'grepmem:recall',
-    order: ctx.systemPrompt.getSectionOrder('TOOL_GREP') + 1,
+    order: promptOrder(ctx),
     text: PROMPT_TEXT,
   })
 

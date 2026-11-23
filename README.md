@@ -81,3 +81,13 @@ The design follows **“Forget Freely, Grep Later: Lossless, Index-Free Memory f
 ## License
 
 MIT.
+
+## Development
+
+The plugin has no runtime dependencies and no build step.
+
+```bash
+node --test
+```
+
+The suite covers grouping and headers, `count`, paging, invalid regex handling, compaction-summary labeling, grep-output exclusion, configured caps, and the worker deadline.
