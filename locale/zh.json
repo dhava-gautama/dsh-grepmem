@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "GrepMem 历史检索",
-    "description": "添加 grep_history 工具，用正则搜索当前会话的完整日志，包括已被压缩移出上下文的对话和工具输出。只读且无需索引：每次搜索读取本地会话日志，并返回有界的分页结果。关闭后工具及其提示词指引都会被移除。"
+    "description": "添加 grep_history 与 grep_sessions 工具，用正则搜索完整会话日志，包括已被压缩移出上下文的对话和工具输出。grep_history 搜索当前会话；grep_sessions 搜索同一工作目录下的较早会话。只读、无需索引，提供有界缓存和 worker 超时。关闭后两个工具及其提示词指引都会被移除。"
   }
 }

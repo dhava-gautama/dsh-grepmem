@@ -3,9 +3,14 @@
  *
  * DSH already keeps an append-only, replay-validated session log, and its
  * compaction backend replaces older history on the model surface without
- * deleting those events. This plugin adds the missing half of GrepMem: an
- * index-free `grep_history` tool that regex-searches the complete raw log of
- * the calling session, including content that compaction removed from context.
+ * deleting those events. This plugin adds the missing half of GrepMem:
+ * index-free regex recall over the raw log.
+ *
+ * Two tools share one bounded cache:
+ * - `grep_history` searches the calling session, including content compaction
+ *   removed from context.
+ * - `grep_sessions` searches earlier sessions in the same workspace, newest
+ *   first, with exact same-`cwd` authorization.
  *
  * No embeddings, index, extra model request, or session event is created. The
  * log stays the source of truth; this plugin only reads it on demand.
@@ -18,8 +23,8 @@ import { Worker } from 'node:worker_threads'
 /** Cordis plugin name used by Loader diagnostics. */
 export const name = 'grepmem'
 
-/** Host services this plugin needs. `sessionQuery` provides replay-validated log reads. */
-export const inject = ['tools', 'systemPrompt', 'sessionQuery']
+/** Host services this plugin needs. */
+export const inject = ['tools', 'systemPrompt', 'sessionQuery', 'agents']
 
 const DEFAULTS = Object.freeze({
   enabled: true,
@@ -28,6 +33,9 @@ const DEFAULTS = Object.freeze({
   lineChars: 300,
   resultChars: 6000,
   timeoutMs: 10_000,
+  maxSessions: 6,
+  cacheSessions: 6,
+  cacheChars: 16_000_000,
   includeReasoning: false,
 })
 
@@ -37,9 +45,13 @@ const LIMITS = Object.freeze({
   lineChars: 2000,
   resultChars: 40_000,
   timeoutMs: 60_000,
+  maxSessions: 25,
+  cacheSessions: 24,
+  cacheChars: 128_000_000,
 })
 
-const TOOL_NAME = 'grep_history'
+const HISTORY_TOOL = 'grep_history'
+const SESSIONS_TOOL = 'grep_sessions'
 
 const KIND_LABELS = Object.freeze({
   user: 'user messages',
@@ -50,39 +62,70 @@ const KIND_LABELS = Object.freeze({
 
 const PROMPT_TEXT = [
   'Your session history is kept in a complete log even after older context is compacted.',
-  'When an exact detail is missing from context - a name, number, ID, path, URL, error, or earlier tool',
-  'result - call grep_history with a specific case-insensitive regex instead of guessing or redoing work.',
+  'Use grep_history to recover exact details from this session - names, numbers, IDs, paths, URLs,',
+  'errors, or earlier tool output - before saying a detail is unavailable or redoing work.',
+  'Use grep_sessions to search earlier sessions in the same workspace when the detail may predate this one.',
 ].join('\n')
 
-const TOOL_DESCRIPTION = [
+const HISTORY_DESCRIPTION = [
   'Search the complete, uncompressed log of this session with a case-insensitive regular expression.',
   'It covers user messages, assistant replies, and tool output that compaction has removed from context;',
   'earlier grep_history results are excluded. Matches are grouped by turn and tool call, and paged with',
-  'offset. Use it to recover exact details - names, numbers, IDs, paths, URLs, errors - instead of guessing.',
+  'offset. Set multiline=true to let the pattern span line boundaries.',
 ].join(' ')
 
-const PARAMETERS = {
+const SESSIONS_DESCRIPTION = [
+  'Search the complete logs of earlier sessions in this workspace (exact same working directory),',
+  'newest first. Use it when a detail may predate the current session; child and subagent sessions are',
+  'excluded unless include_child_sessions=true. Results are grouped by session title, then by turn and',
+  'tool call, and paged with offset. Read-only and index-free.',
+].join(' ')
+
+const COMMON_PROPERTIES = {
+  pattern: {
+    type: 'string',
+    description: 'Case-insensitive JavaScript regular expression. Prefer exact strings you saw before: names, numbers, IDs, paths, URLs, error text.',
+  },
+  max_matches: {
+    type: 'integer',
+    description: 'Matching lines (or matches in multiline mode) to show. Defaults to 10; the configured cap applies.',
+  },
+  offset: {
+    type: 'integer',
+    description: 'Skip this many matches. Use the offset in the result footer to get the next page.',
+  },
+  context_lines: {
+    type: 'integer',
+    description: 'Lines of context around each match. Defaults to 1, at most 3.',
+  },
+  count: {
+    type: 'boolean',
+    description: 'Return only the number of matching lines or matches. Defaults to false.',
+  },
+  multiline: {
+    type: 'boolean',
+    description: 'Let the pattern span line boundaries within one history entry. Each regex match is then one hit.',
+  },
+}
+
+const HISTORY_PARAMETERS = {
+  type: 'object',
+  properties: { ...COMMON_PROPERTIES },
+  required: ['pattern'],
+  additionalProperties: false,
+}
+
+const SESSIONS_PARAMETERS = {
   type: 'object',
   properties: {
-    pattern: {
-      type: 'string',
-      description: 'Case-insensitive JavaScript regular expression. Prefer exact strings you saw before: names, numbers, IDs, paths, URLs, error text.',
-    },
-    max_matches: {
+    ...COMMON_PROPERTIES,
+    max_sessions: {
       type: 'integer',
-      description: 'Matching lines to show. Defaults to 10, at most 30.',
+      description: 'Sessions to search, newest first. Defaults to the configured limit.',
     },
-    offset: {
-      type: 'integer',
-      description: 'Skip this many matching lines. Use the offset in the result footer to get the next page.',
-    },
-    context_lines: {
-      type: 'integer',
-      description: 'Lines of context around each matching line. Defaults to 1, at most 3.',
-    },
-    count: {
+    include_child_sessions: {
       type: 'boolean',
-      description: 'Return only the number of matching lines. Defaults to false.',
+      description: 'Also search forked and subagent sessions. Defaults to false.',
     },
   },
   required: ['pattern'],
@@ -94,11 +137,7 @@ const OUTPUT = {
   render: (_args, value) => [{ type: 'text', text: value }],
 }
 
-/**
- * Resolve the deployment config with bounds, so a bad row cannot make one call
- * scan or render without limit.
- * @param {unknown} raw - Loader-supplied config object.
- */
+/** Resolve deployment config with bounds, so a bad row cannot remove every limit. */
 function resolveConfig(raw) {
   const config = raw !== null && typeof raw === 'object' ? raw : {}
   return {
@@ -108,6 +147,9 @@ function resolveConfig(raw) {
     lineChars: clampInteger(config.lineChars, DEFAULTS.lineChars, 80, LIMITS.lineChars),
     resultChars: clampInteger(config.resultChars, DEFAULTS.resultChars, 500, LIMITS.resultChars),
     timeoutMs: clampInteger(config.timeoutMs, DEFAULTS.timeoutMs, 1000, LIMITS.timeoutMs),
+    maxSessions: clampInteger(config.maxSessions, DEFAULTS.maxSessions, 1, LIMITS.maxSessions),
+    cacheSessions: clampInteger(config.cacheSessions, DEFAULTS.cacheSessions, 1, LIMITS.cacheSessions),
+    cacheChars: clampInteger(config.cacheChars, DEFAULTS.cacheChars, 1_000_000, LIMITS.cacheChars),
     includeReasoning: config.includeReasoning === true,
   }
 }
@@ -121,6 +163,10 @@ function clampInteger(value, fallback, min, max) {
 function integerArgument(value, fallback, min, max) {
   if (value === undefined || value === null || value === '') return fallback
   return clampInteger(value, fallback, min, max)
+}
+
+function booleanArgument(value) {
+  return value === true || value === 'true'
 }
 
 /** Render model message content as searchable text without inventing data. */
@@ -162,90 +208,173 @@ function argsPreview(raw) {
 }
 
 /**
- * Turn raw session events into GrepMem-style history entries: a label plus the
- * lines that produced it. Events hidden from the surface by compaction are
- * included; earlier grep_history output is skipped to avoid echoing recalls.
- * @param {readonly any[]} events - raw SessionEvents from sessionQuery.
- * @param {{ includeReasoning: boolean }} options
+ * Incremental entry builder. State is cached per session so a later call only
+ * folds events appended since the previous read; turn/step and pending tool
+ * calls survive across batches.
  */
-function buildEntries(events, options) {
-  const entries = []
-  const pendingCalls = new Map()
-  let turn = 0
-  let step = 0
+function createEntryState() {
+  return { turn: 0, step: 0, pendingCalls: new Map(), entries: [], chars: 0 }
+}
 
+function addEntry(state, options, kind, header, text) {
+  const lines = splitLines(text)
+  let chars = header.length + 1
+  for (const line of lines) chars += line.length + 1
+  state.entries.push({ kind, header, lines, sessionId: options.sessionId })
+  state.chars += chars
+}
+
+/**
+ * Fold raw session events into GrepMem-style entries: a label plus the lines
+ * that produced it. Events hidden from the surface by compaction stay
+ * available because the raw log is read; earlier grep output is skipped to
+ * avoid echoing recalls.
+ */
+function appendEntries(state, events, options) {
   for (const event of events) {
     const data = event?.data
     if (data === null || typeof data !== 'object') continue
     switch (event.type) {
       case 'turn/start':
-        if (Number.isInteger(data.turn)) turn = data.turn
+        if (Number.isInteger(data.turn)) state.turn = data.turn
         break
       case 'step/start':
-        if (Number.isInteger(data.step)) step = data.step
+        if (Number.isInteger(data.step)) state.step = data.step
+        break
+      case 'turn/end':
+        state.pendingCalls.clear()
         break
       case 'user/message': {
         const message = data.message
-        const sourceKind = message?.source?.kind
-        const kind = sourceKind === 'compact-checkpoint' ? 'summary' : 'user'
-        const label = kind === 'summary' ? 'compaction summary' : 'user'
-        entries.push({
+        const kind = message?.source?.kind === 'compact-checkpoint' ? 'summary' : 'user'
+        addEntry(
+          state,
+          options,
           kind,
-          header: `[turn ${turn} ${label}]`,
-          lines: splitLines(contentText(message?.content, options.includeReasoning)),
-        })
+          `[turn ${state.turn} ${kind === 'summary' ? 'compaction summary' : 'user'}]`,
+          contentText(message?.content, options.includeReasoning),
+        )
         break
       }
       case 'assistant/message': {
         const text = contentText(data.message?.content, options.includeReasoning)
-        if (text.trim().length === 0) break
-        entries.push({
-          kind: 'assistant',
-          header: `[turn ${turn} step ${step} assistant]`,
-          lines: splitLines(text),
-        })
+        if (text.trim().length > 0) {
+          addEntry(state, options, 'assistant', `[turn ${state.turn} step ${state.step} assistant]`, text)
+        }
         break
       }
       case 'tool/call': {
         if (typeof data.callId === 'string') {
-          pendingCalls.set(data.callId, {
+          state.pendingCalls.set(data.callId, {
             name: typeof data.name === 'string' ? data.name : 'tool',
             arguments: typeof data.arguments === 'string' ? data.arguments : '',
-            turn,
-            step,
+            turn: state.turn,
+            step: state.step,
           })
         }
         break
       }
       case 'tool/result': {
         const callId = data.message?.toolCallId ?? data.callId
-        const call = typeof callId === 'string' ? pendingCalls.get(callId) : undefined
-        if (typeof callId === 'string') pendingCalls.delete(callId)
+        const call = typeof callId === 'string' ? state.pendingCalls.get(callId) : undefined
+        if (typeof callId === 'string') state.pendingCalls.delete(callId)
         const toolName = call?.name ?? 'tool'
-        if (toolName === TOOL_NAME) break
-        const entryTurn = call?.turn ?? turn
-        const entryStep = call?.step ?? step
+        if (toolName === HISTORY_TOOL || toolName === SESSIONS_TOOL) break
         const args = argsPreview(call?.arguments)
-        entries.push({
-          kind: 'tool',
-          header: `[turn ${entryTurn} step ${entryStep} tool ${toolName}${args ? `(${args})` : ''}]`,
-          lines: splitLines(contentText(data.message?.content, options.includeReasoning)),
-        })
+        addEntry(
+          state,
+          options,
+          'tool',
+          `[turn ${call?.turn ?? state.turn} step ${call?.step ?? state.step} tool ${toolName}${args ? `(${args})` : ''}]`,
+          contentText(data.message?.content, options.includeReasoning),
+        )
         break
       }
       default:
         break
     }
   }
+}
 
-  return entries
+/** Small LRU over per-session entry states, bounded by session count and characters. */
+function createEntryCache(config) {
+  const sessions = new Map()
+  let chars = 0
+
+  function evict() {
+    while (sessions.size > config.cacheSessions || chars > config.cacheChars) {
+      const oldestId = sessions.keys().next().value
+      if (oldestId === undefined) break
+      chars -= sessions.get(oldestId).chars
+      sessions.delete(oldestId)
+    }
+  }
+
+  return {
+    get(sessionId) {
+      return sessions.get(sessionId)
+    },
+    touch(sessionId) {
+      const entry = sessions.get(sessionId)
+      if (entry === undefined) return
+      sessions.delete(sessionId)
+      sessions.set(sessionId, entry)
+    },
+    set(sessionId, state, nextSeq) {
+      const prior = sessions.get(sessionId)
+      if (prior !== undefined) {
+        chars -= prior.chars
+        sessions.delete(sessionId)
+      }
+      if (state.chars > config.cacheChars) return
+      sessions.set(sessionId, { state, nextSeq, chars: state.chars })
+      chars += state.chars
+      evict()
+    },
+  }
+}
+
+/**
+ * Read a session's entries, reusing the cached fold when nothing changed and
+ * appending only the suffix when events were added. Falls back to a full fold
+ * when the cached log is no longer a prefix of the observed log.
+ */
+async function loadEntries(ctx, cache, sessionId, options, liveSeq) {
+  const cached = cache.get(sessionId)
+  if (cached !== undefined && liveSeq !== undefined && cached.nextSeq === liveSeq) {
+    cache.touch(sessionId)
+    return { state: cached.state }
+  }
+
+  let snapshot
+  try {
+    snapshot = await ctx.sessionQuery.readSession(sessionId)
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) }
+  }
+  const events = Array.isArray(snapshot?.events) ? snapshot.events : []
+
+  if (cached !== undefined) {
+    if (cached.nextSeq === events.length) {
+      cache.touch(sessionId)
+      return { state: cached.state }
+    }
+    if (cached.nextSeq < events.length) {
+      appendEntries(cached.state, events.slice(cached.nextSeq), options)
+      cache.set(sessionId, cached.state, events.length)
+      return { state: cached.state }
+    }
+  }
+
+  const state = createEntryState()
+  appendEntries(state, events, options)
+  cache.set(sessionId, state, events.length)
+  return { state }
 }
 
 /**
  * Run the regex search in a worker so a pathological pattern or a very large
  * log can be terminated at the configured deadline instead of blocking the Host.
- * @returns {Promise<{ kind: 'ok', total: number, page: number[][], entryCount: number, byKind: Record<string, number> }
- *   | { kind: 'timeout' } | { kind: 'aborted' } | { kind: 'error', message: string }>}
  */
 function searchEntries(entries, pattern, options) {
   return new Promise(resolve => {
@@ -271,6 +400,7 @@ function searchEntries(entries, pattern, options) {
           offset: options.offset,
           limit: options.limit,
           countOnly: options.countOnly,
+          multiline: options.multiline,
         },
       })
     } catch (error) {
@@ -293,11 +423,11 @@ function searchEntries(entries, pattern, options) {
 }
 
 /** Clip one display line around the match without changing the stored log. */
-function clipLine(line, matchIndex, lineChars) {
+function clipLine(line, column, lineChars) {
   if (line.length <= lineChars) return line
-  const start = matchIndex === undefined
+  const start = column === undefined
     ? 0
-    : Math.max(0, Math.min(matchIndex - Math.floor(lineChars / 3), line.length - lineChars))
+    : Math.max(0, Math.min(column - Math.floor(lineChars / 3), line.length - lineChars))
   return `${start > 0 ? '...' : ''}${line.slice(start, start + lineChars)}${start + lineChars < line.length ? '...' : ''}`
 }
 
@@ -305,19 +435,27 @@ function plural(count, singular, pluralForm) {
   return count === 1 ? singular : pluralForm
 }
 
-function summarize(total, entryCount, byKind) {
-  const parts = Object.entries(byKind)
+function summarize(total, entryCount, byKind, sessionCount, multiline) {
+  const noun = multiline ? 'match' : 'line'
+  const nounPlural = multiline ? 'matches' : 'lines'
+  const parts = Object.entries(byKind ?? {})
     .sort((left, right) => right[1] - left[1])
     .map(([kind, count]) => `${count} in ${KIND_LABELS[kind] ?? kind}`)
+  const sessions = sessionCount !== undefined && sessionCount > 1 ? ` across ${sessionCount} sessions` : ''
   const detail = parts.length > 0 ? ` (${parts.join(', ')})` : ''
-  return `${total} matching line${total === 1 ? '' : 's'} in ${entryCount} history ${plural(entryCount, 'entry', 'entries')}${detail}.`
+  return `${total} matching ${total === 1 ? noun : nounPlural} in ${entryCount} history ${plural(entryCount, 'entry', 'entries')}${sessions}${detail}.`
+}
+
+function shortId(sessionId) {
+  const text = String(sessionId)
+  return `session ${text.slice(0, 8)}`
 }
 
 /**
- * Format a page the way GrepMem renders recall: a summary, then entries under
- * `== [header]`, with numbered lines and explicit match/context markers.
+ * Format a page the way GrepMem renders recall: a summary, then session and
+ * entry headers, with numbered lines and explicit match/context markers.
  */
-function formatResult(entries, pattern, config, args, result) {
+function formatResult(entries, pattern, config, args, result, labels) {
   switch (result.kind) {
     case 'aborted':
       return 'Error: history search was cancelled.'
@@ -329,10 +467,10 @@ function formatResult(entries, pattern, config, args, result) {
       break
   }
 
-  const { total, page, entryCount, byKind } = result
+  const { total, page, entryCount, byKind, sessionCount } = result
   if (total === 0) return `No matches for /${pattern}/.`
 
-  const head = summarize(total, entryCount, byKind ?? {})
+  const head = summarize(total, entryCount, byKind, sessionCount, args.multiline)
   if (args.countOnly) return head
   if (args.offset >= total) return `${head}\nNo matches at offset=${args.offset}.`
 
@@ -341,8 +479,9 @@ function formatResult(entries, pattern, config, args, result) {
   let shown = 0
   let lastEntry = -1
   let lastEnd = 0
+  let lastSession
 
-  for (const [entryIndex, lineIndex, matchIndex] of page) {
+  for (const [entryIndex, lineIndex, column] of page) {
     if (shown >= config.maxMatches) break
     const entry = entries[entryIndex]
     if (entry === undefined) continue
@@ -350,6 +489,13 @@ function formatResult(entries, pattern, config, args, result) {
     const start = Math.max(0, lineIndex - args.contextLines)
     const end = Math.min(lines.length, lineIndex + args.contextLines + 1)
     const parts = []
+
+    if (labels !== undefined && entry.sessionId !== lastSession) {
+      parts.push(`## ${labels.get(entry.sessionId) ?? shortId(entry.sessionId)}`)
+      lastSession = entry.sessionId
+      lastEntry = -1
+      lastEnd = 0
+    }
 
     if (entryIndex !== lastEntry) {
       parts.push(`== ${entry.header}`)
@@ -362,7 +508,7 @@ function formatResult(entries, pattern, config, args, result) {
     const from = Math.min(Math.max(start, lastEnd), lineIndex)
     for (let index = from; index < end; index += 1) {
       const isMatch = index === lineIndex
-      parts.push(`  ${index + 1}${isMatch ? ':' : '-'} ${clipLine(lines[index], isMatch ? matchIndex : undefined, config.lineChars)}`)
+      parts.push(`  ${index + 1}${isMatch ? ':' : '-'} ${clipLine(lines[index], isMatch ? column : undefined, config.lineChars)}`)
     }
     lastEnd = Math.max(lastEnd, end)
 
@@ -382,6 +528,136 @@ function formatResult(entries, pattern, config, args, result) {
   return out.join('\n')
 }
 
+function parseArgs(args, config) {
+  return {
+    pattern: typeof args?.pattern === 'string' ? args.pattern : '',
+    maxMatches: integerArgument(args?.max_matches, config.maxMatches, 1, config.maxMatches),
+    offset: integerArgument(args?.offset, 0, 0, Number.MAX_SAFE_INTEGER),
+    contextLines: integerArgument(args?.context_lines, 1, 0, config.maxContextLines),
+    countOnly: booleanArgument(args?.count),
+    multiline: booleanArgument(args?.multiline),
+  }
+}
+
+function validatePattern(pattern) {
+  if (pattern.length === 0) return 'Error: pattern must be a non-empty regular expression.'
+  if (pattern.length > 2000) return 'Error: pattern is too long; use a shorter, more specific expression.'
+  return undefined
+}
+
+function searchOptions(parsed, config) {
+  return {
+    offset: parsed.offset,
+    limit: parsed.maxMatches,
+    countOnly: parsed.countOnly,
+    multiline: parsed.multiline,
+    timeoutMs: config.timeoutMs,
+  }
+}
+
+/** `grep_history`: this session's raw log. */
+async function executeHistory(ctx, args, exec, config, cache) {
+  const parsed = parseArgs(args, config)
+  const invalid = validatePattern(parsed.pattern)
+  if (invalid !== undefined) return invalid
+
+  const agent = exec?.agent
+  const sessionId = agent?.session?.id
+  if (sessionId === undefined) {
+    return 'Error: grep_history needs an agent-bound session, but this call has none.'
+  }
+
+  const loaded = await loadEntries(
+    ctx,
+    cache,
+    sessionId,
+    { includeReasoning: config.includeReasoning, sessionId },
+    agent.session.seq,
+  )
+  if (loaded.error !== undefined) return `Error: could not read this session's history: ${loaded.error}`
+
+  const entries = loaded.state.entries
+  const result = await searchEntries(entries, parsed.pattern, {
+    ...searchOptions(parsed, config),
+    signal: exec?.signal,
+  })
+  return formatResult(entries, parsed.pattern, config, parsed, result)
+}
+
+/** `grep_sessions`: earlier sessions with the exact same working directory. */
+async function executeSessions(ctx, args, exec, config, cache) {
+  const parsed = parseArgs(args, config)
+  const invalid = validatePattern(parsed.pattern)
+  if (invalid !== undefined) return invalid
+
+  const caller = exec?.agent?.session
+  if (caller === undefined) return 'Error: grep_sessions needs an agent-bound session, but this call has none.'
+  const cwd = caller.header?.cwd
+  if (typeof cwd !== 'string' || cwd.length === 0) {
+    return 'Error: grep_sessions requires a session with a working directory.'
+  }
+
+  const maxSessions = integerArgument(args?.max_sessions, config.maxSessions, 1, config.maxSessions)
+  const includeChildren = booleanArgument(args?.include_child_sessions)
+
+  let records
+  try {
+    records = await ctx.sessionQuery.filterSessions([{ kind: 'cwd', values: [cwd] }], exec.signal)
+  } catch (error) {
+    return `Error: could not list workspace sessions: ${error instanceof Error ? error.message : String(error)}`
+  }
+
+  const targets = records
+    .filter(record => record.header.id !== caller.id)
+    .filter(record => includeChildren || (record.header.parentSession === undefined && record.header.origin !== 'subagent'))
+    .slice(0, maxSessions)
+
+  if (targets.length === 0) return 'No earlier sessions in this workspace.'
+
+  const merged = []
+  let unreadable = 0
+  for (const record of targets) {
+    const sessionId = record.header.id
+    const liveAgent = ctx.agents.get(sessionId)
+    const loaded = await loadEntries(
+      ctx,
+      cache,
+      sessionId,
+      { includeReasoning: config.includeReasoning, sessionId },
+      liveAgent?.session?.seq,
+    )
+    if (loaded.error !== undefined) {
+      unreadable += 1
+      continue
+    }
+    for (const entry of loaded.state.entries) merged.push(entry)
+  }
+
+  if (merged.length === 0) return `No readable history in ${targets.length} earlier session(s).`
+
+  const result = await searchEntries(merged, parsed.pattern, {
+    ...searchOptions(parsed, config),
+    signal: exec?.signal,
+  })
+
+  let labels
+  if (result.kind === 'ok' && !parsed.countOnly) {
+    labels = new Map()
+    const hitIds = new Set(result.page.map(hit => merged[hit[0]]?.sessionId).filter(Boolean))
+    for (const sessionId of hitIds) {
+      try {
+        const title = await ctx.sessionQuery.readTitle(sessionId, exec.signal)
+        labels.set(sessionId, title?.title ?? shortId(sessionId))
+      } catch {
+        labels.set(sessionId, shortId(sessionId))
+      }
+    }
+  }
+
+  const output = formatResult(merged, parsed.pattern, config, parsed, result, labels)
+  return unreadable > 0 ? `${output}\n(${unreadable} session(s) could not be read and were skipped.)` : output
+}
+
 /** Place recall guidance next to the file-grep tool, falling back on older Harness versions. */
 function promptOrder(ctx) {
   try {
@@ -393,10 +669,12 @@ function promptOrder(ctx) {
   return 1510
 }
 
-/** Register the recall tool and its short system-prompt guidance. */
+/** Register both recall tools and their shared prompt guidance. */
 export function apply(ctx, config) {
   const resolved = resolveConfig(config)
   if (!resolved.enabled) return
+
+  const cache = createEntryCache(resolved)
 
   ctx.systemPrompt.section({
     name: 'grepmem:recall',
@@ -405,44 +683,20 @@ export function apply(ctx, config) {
   })
 
   ctx.tools.register({
-    name: TOOL_NAME,
-    description: TOOL_DESCRIPTION,
-    parameters: PARAMETERS,
+    name: HISTORY_TOOL,
+    description: HISTORY_DESCRIPTION,
+    parameters: HISTORY_PARAMETERS,
     output: OUTPUT,
     timeoutMs: resolved.timeoutMs + 5000,
-    async execute(args, exec) {
-      const pattern = typeof args?.pattern === 'string' ? args.pattern : ''
-      if (pattern.length === 0) return 'Error: pattern must be a non-empty regular expression.'
-      if (pattern.length > 2000) return 'Error: pattern is too long; use a shorter, more specific expression.'
+    execute: (args, exec) => executeHistory(ctx, args, exec, resolved, cache),
+  })
 
-      const agent = exec?.agent
-      const sessionId = agent?.session?.id
-      if (sessionId === undefined) {
-        return 'Error: grep_history needs an agent-bound session, but this call has none.'
-      }
-
-      const maxMatches = integerArgument(args.max_matches, resolved.maxMatches, 1, resolved.maxMatches)
-      const offset = integerArgument(args.offset, 0, 0, Number.MAX_SAFE_INTEGER)
-      const contextLines = integerArgument(args.context_lines, 1, 0, resolved.maxContextLines)
-      const countOnly = args.count === true || args.count === 'true'
-
-      let snapshot
-      try {
-        snapshot = await ctx.sessionQuery.readSession(sessionId)
-      } catch (error) {
-        return `Error: could not read this session's history: ${error instanceof Error ? error.message : String(error)}`
-      }
-
-      const entries = buildEntries(snapshot?.events ?? [], resolved)
-      const search = await searchEntries(entries, pattern, {
-        offset,
-        limit: maxMatches,
-        countOnly,
-        timeoutMs: resolved.timeoutMs,
-        signal: exec?.signal,
-      })
-
-      return formatResult(entries, pattern, resolved, { offset, contextLines, countOnly }, search)
-    },
+  ctx.tools.register({
+    name: SESSIONS_TOOL,
+    description: SESSIONS_DESCRIPTION,
+    parameters: SESSIONS_PARAMETERS,
+    output: OUTPUT,
+    timeoutMs: resolved.timeoutMs + 15_000,
+    execute: (args, exec) => executeSessions(ctx, args, exec, resolved, cache),
   })
 }
