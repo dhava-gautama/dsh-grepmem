@@ -106,7 +106,7 @@ Set these in the profile's `cordis.patch.yml` under the `grepmem` row:
 
 1. `sessionQuery.readSession()` returns the replay-validated raw log of a session. It prefers the live session, so unflushed events are included.
 2. Raw events are folded into entries: user messages, assistant replies, compaction summaries, and one entry per tool result paired with its call. Content compaction shadowed stays available because the raw log is read, not the model surface.
-3. The fold is cached per session and extended by suffix on later calls. A session's next sequence number is used to skip the read entirely when nothing changed.
+3. The fold is cached per session and extended by suffix on later calls. A live session's next sequence number skips the read entirely when nothing changed; a persisted session is read again, but its fold is reused when the log length is unchanged.
 4. A worker thread runs the regex (line mode or multiline) with a watchdog. The page renderer labels sessions and turns, clips long lines, and stops at `resultChars`.
 
 ## Limits
