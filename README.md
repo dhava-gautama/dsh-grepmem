@@ -8,10 +8,14 @@ No embeddings, vector index, memory extraction, or extra model request. Nothing 
 
 ## Install
 
-The bundle is installed through **Plugins** in DSH:
+Clone the repository, then install the directory through **Plugins** in DSH:
+
+```bash
+git clone https://github.com/dhava-gautama/dsh-grepmem
+```
 
 1. Open **Plugins → Add plugin**.
-2. Choose the local directory containing this package.
+2. Choose the cloned `dsh-grepmem` directory.
 3. Enable **GrepMem history recall** if it is not enabled automatically.
 
 Installing adds the `grep_history` tool and a short system-prompt section to every agent in the profile. Turning the bundle off removes both.

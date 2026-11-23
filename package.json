@@ -29,5 +29,13 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dhava-gautama/dsh-grepmem.git"
+  },
+  "homepage": "https://github.com/dhava-gautama/dsh-grepmem#readme",
+  "bugs": {
+    "url": "https://github.com/dhava-gautama/dsh-grepmem/issues"
   }
 }
