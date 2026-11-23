@@ -24,7 +24,7 @@ Installing adds two tools and a short system-prompt section to every agent in th
 
 ### `grep_history` — this session
 
-Searches the current session's complete raw log, including messages and tool output that compaction removed from the model surface. Earlier `grep_history`/`grep_sessions` output is excluded so recall does not echo itself.
+Searches the current session's complete raw log, including messages and tool output that compaction removed from the model surface. Earlier `grep_history`/`grep_sessions` **tool results** are excluded. Text quoted in other messages — for example a subagent report — is still searchable, so a repeated search can surface a previous answer.
 
 ```text
 grep_history(pattern="budget-17", context_lines=2)
@@ -116,6 +116,7 @@ Set these in the profile's `cordis.patch.yml` under the `grepmem` row:
 - **Cold reads are bounded only by the process.** The worker deadline covers matching, not loading and folding a very large log. The LRU bounds how much stays in memory, not how long the first read takes.
 - **Compaction is optional.** Recall works without it, but there is less discarded context to recover.
 - **Regex is not RE2.** Patterns run in JavaScript; the worker deadline is the safety net. Extremely large logs can still make a single search slow before the deadline fires.
+- **Recall can echo prior answers.** Only grep tool results are skipped. If a previous answer, subagent report, or summary quoted a match, that text remains in the log and can match again. Use more specific patterns or a session scope when that noise matters.
 
 ## Development
 

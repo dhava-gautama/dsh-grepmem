@@ -87,6 +87,7 @@ test('groups matches by turn and tool header', async () => {
   const text = await tools.get('grep_history').execute({ pattern: 'rotate-42' }, execFor('s1'))
   assert.match(text, /^3 matching lines in 3 history entries/)
   assert.match(text, /\[turn 1 user\]/)
+  assert.match(text, /Deploy key rotate-42/)
   assert.match(text, /\[turn 1 step 1 tool bash\(\{"command":"cat config"\}\)\]/)
   assert.match(text, /\[turn 2 compaction summary\]/)
   assert.match(text, /\(showing matches 1-3 of 3\)/)
