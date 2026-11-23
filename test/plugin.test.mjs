@@ -9,7 +9,7 @@ function baseEvents() {
     { type: 'step/start', data: { turn: 1, step: 1 } },
     {
       type: 'user/message',
-      data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Deploy key rotate-42 for staging.' }] } },
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Deploy key rotate-42 for staging.' }] },
     },
     {
       type: 'assistant/message',
@@ -30,7 +30,7 @@ function baseEvents() {
     { type: 'turn/start', data: { turn: 2 } },
     {
       type: 'user/message',
-      data: { message: { source: { kind: 'compact-checkpoint' }, content: [{ type: 'text', text: 'Summary: staging uses rotate-42.' }] } },
+      data: { source: { kind: 'compact-checkpoint' }, content: [{ type: 'text', text: 'Summary: staging uses rotate-42.' }] },
     },
   ]
 }
@@ -136,7 +136,7 @@ test('multiline lets a pattern span lines', async () => {
   const events = {
     s1: [{
       type: 'user/message',
-      data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: 'alpha\nbeta\ngamma' }] } },
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'alpha\nbeta\ngamma' }] },
     }],
   }
   const { tools } = harness({ events })
@@ -163,7 +163,7 @@ test('reuses the cached fold and appends only new events', async () => {
 
   events.s1.push({
     type: 'user/message',
-    data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: 'later detail zeta-9' }] } },
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'later detail zeta-9' }] },
   })
   liveSeqs.s1 = events.s1.length
   const text = await tool.execute({ pattern: 'zeta-9' }, execFor('s1', { seq: liveSeqs.s1 }))
@@ -176,11 +176,11 @@ test('searches earlier workspace sessions and excludes children', async () => {
     s1: baseEvents(),
     s2: [{
       type: 'user/message',
-      data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Earlier note omega-7' }] } },
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Earlier note omega-7' }] },
     }],
     s3: [{
       type: 'user/message',
-      data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Child note omega-7' }] } },
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Child note omega-7' }] },
     }],
   }
   const records = [
@@ -206,7 +206,7 @@ test('grep_sessions can include child sessions', async () => {
     s1: baseEvents(),
     s2: [{
       type: 'user/message',
-      data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Child note omega-7' }] } },
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Child note omega-7' }] },
     }],
   }
   const records = [
@@ -233,7 +233,7 @@ test('terminates a pathological pattern at the deadline', async () => {
     events: {
       s1: [{
         type: 'user/message',
-        data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: 'a'.repeat(64) + '!' }] } },
+        data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'a'.repeat(64) + '!' }] },
       }],
     },
     config: { timeoutMs: 1000 },

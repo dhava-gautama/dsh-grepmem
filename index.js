@@ -245,7 +245,8 @@ function appendEntries(state, events, options) {
         state.pendingCalls.clear()
         break
       case 'user/message': {
-        const message = data.message
+        // UserMessage is the event data itself; older/synthetic shapes may nest it under `message`.
+        const message = data.message ?? data
         const kind = message?.source?.kind === 'compact-checkpoint' ? 'summary' : 'user'
         addEntry(
           state,
