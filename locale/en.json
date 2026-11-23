@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GrepMem history recall",
+    "description": "Adds a grep_history tool that regex-searches this session's complete log, including messages and tool output removed by compaction. It is read-only and index-free: every search reads the local session log and returns a bounded, paged view. Turn it off to remove the tool and its prompt guidance."
+  }
+}

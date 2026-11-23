@@ -1,0 +1,3 @@
+- insert:
+    - id: grepmem
+      name: '@local/dsh-grepmem'
